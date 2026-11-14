@@ -840,6 +840,70 @@ pub async fn check_latest_release() -> Result<(String, String), String> {
     Ok((tag, download_url))
 }
 
+/// The `checksums.txt` URL next to a release asset URL, and the asset's file name.
+fn checksums_url_for(asset_url: &str) -> Option<(String, &str)> {
+    let (base, name) = asset_url.rsplit_once('/')?;
+    if name.is_empty() || base.is_empty() {
+        return None;
+    }
+    Some((format!("{base}/checksums.txt"), name))
+}
+
+/// The SHA-256 that a `checksums.txt` ("<hex>  <file>" per line) lists for `asset`.
+fn expected_sha256(checksums: &str, asset: &str) -> Option<String> {
+    checksums.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let hash = parts.next()?;
+        let name = parts.next()?.trim_start_matches('*');
+        (name == asset && hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| hash.to_ascii_lowercase())
+    })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Fail unless `bytes` match the SHA-256 that the release's `checksums.txt`
+/// lists for the downloaded asset. A missing or unreadable checksum fails too.
+async fn verify_release_download(
+    client: &reqwest::Client,
+    asset_url: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let (sums_url, asset) = checksums_url_for(asset_url)
+        .ok_or_else(|| format!("Cannot find the release checksums for {asset_url}"))?;
+    let resp = client
+        .get(&sums_url)
+        .header("User-Agent", "skillshare-app")
+        .send()
+        .await
+        .map_err(|e| format!("Checksum download failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "Checksum download returned status {}",
+            resp.status()
+        ));
+    }
+    let sums = resp
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read checksums: {e}"))?;
+    let expected = expected_sha256(&sums, asset)
+        .ok_or_else(|| format!("checksums.txt has no entry for {asset}"))?;
+    let actual = sha256_hex(bytes);
+    if actual != expected {
+        return Err(format!(
+            "Checksum mismatch for {asset}: expected {expected}, got {actual}. The download was discarded."
+        ));
+    }
+    Ok(())
+}
+
 /// Download the CLI tarball, extract it, and install to the app bin dir.
 /// Returns the path to the installed binary.
 pub async fn download_cli(url: &str) -> Result<String, String> {
@@ -870,6 +934,13 @@ pub async fn download_cli(url: &str) -> Result<String, String> {
         .bytes()
         .await
         .map_err(|e| format!("Failed to read download body: {e}"))?;
+
+    // Check the archive against the checksums.txt published with the same
+    // release before anything is unpacked or run.
+    if let Err(e) = verify_release_download(&client, url, &bytes).await {
+        std::fs::remove_dir_all(&tmp_dir).ok();
+        return Err(e);
+    }
 
     let archive_name = if cfg!(target_os = "windows") {
         "skillshare.zip"
@@ -965,6 +1036,50 @@ pub async fn download_cli(url: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SUMS: &str = "\
+1111111111111111111111111111111111111111111111111111111111111111  skillshare_0.30.8_darwin_arm64.tar.gz
+ABCDEFabcdef0123456789abcdef0123456789abcdef0123456789abcdef0123  skillshare_0.30.8_windows_amd64.zip
+";
+
+    #[test]
+    fn checksums_url_sits_next_to_the_asset() {
+        let url = "https://github.com/runkids/skillshare/releases/download/v0.30.8/skillshare_0.30.8_windows_amd64.zip";
+        assert_eq!(
+            checksums_url_for(url),
+            Some((
+                "https://github.com/runkids/skillshare/releases/download/v0.30.8/checksums.txt"
+                    .to_string(),
+                "skillshare_0.30.8_windows_amd64.zip"
+            ))
+        );
+        assert_eq!(checksums_url_for("https://example.com/"), None);
+    }
+
+    #[test]
+    fn expected_sha256_finds_the_exact_asset_only() {
+        assert_eq!(
+            expected_sha256(SUMS, "skillshare_0.30.8_windows_amd64.zip").as_deref(),
+            Some("abcdefabcdef0123456789abcdef0123456789abcdef0123456789abcdef0123")
+        );
+        assert_eq!(
+            expected_sha256(SUMS, "skillshare_0.30.8_windows_amd64"),
+            None
+        );
+        assert_eq!(
+            expected_sha256(SUMS, "skillshare_0.30.8_linux_amd64.tar.gz"),
+            None
+        );
+        assert_eq!(expected_sha256("nothex  a.zip\n", "a.zip"), None);
+    }
+
+    #[test]
+    fn sha256_hex_matches_the_standard_vector() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]
