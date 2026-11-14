@@ -1,0 +1,264 @@
+name: Fork patched release
+
+# endgame302 fork only. Rebuilds the latest runkids/skillshare-app release with this fork's patches
+# (the commits on `patched` that upstream does not have), runs the same checks as upstream's ci.yml,
+# builds the Windows installer signed with this fork's updater key, and publishes it here under the
+# same version. Builds point the app's updater at this fork's releases and its CLI download at
+# endgame302/skillshare. A patch that no longer applies, or a failing check, opens an issue.
+
+on:
+  schedule:
+    - cron: "47 5 * * 1" # Mondays 05:47 UTC, after the CLI fork's run
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Upstream release tag to build (default = latest upstream release)
+        type: string
+        default: ""
+      force:
+        description: Rebuild even if this fork already has a release for the tag
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: runkids/skillshare-app
+  CLI_FORK: endgame302/skillshare
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+      build: ${{ steps.pick.outputs.build }}
+      sha: ${{ steps.replay.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: patched
+          fetch-depth: 0
+          # Pushing a rebase that carries upstream's workflow changes needs the `workflows`
+          # permission, which the default GITHUB_TOKEN never has.
+          token: ${{ secrets.FORK_BOT_TOKEN }}
+
+      - name: Fetch upstream tags into their own namespace
+        run: |
+          git remote add upstream "https://github.com/$UPSTREAM.git"
+          git fetch --no-tags upstream '+refs/tags/v*:refs/upstream-tags/v*'
+
+      - name: Pick the upstream release
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          TAG="${INPUT_TAG:-$(gh release view --repo "$UPSTREAM" --json tagName -q .tagName)}"
+          git rev-parse -q --verify "refs/upstream-tags/$TAG" >/dev/null || { echo "::error::upstream has no tag $TAG"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # Only a published release counts; a draft left by a failed run is rebuilt.
+          PUBLISHED=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft -q '.isDraft == false' 2>/dev/null || echo false)
+          if [ "$PUBLISHED" = "true" ] && [ "$FORCE" != "true" ]; then
+            echo "This fork already has a release for $TAG. Nothing to do." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Replay this fork's patches onto the upstream release
+        id: replay
+        if: steps.pick.outputs.build == 'true'
+        env:
+          TAG: ${{ steps.pick.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          BEFORE=$(git log --format='%s' "refs/upstream-tags/$TAG..HEAD")
+          if ! git rebase "refs/upstream-tags/$TAG"; then
+            git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts.txt"
+            git rebase --abort
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            echo "::error::The patches do not apply to $TAG"
+            exit 1
+          fi
+          AFTER=$(git log --format='%s' "refs/upstream-tags/$TAG..HEAD")
+          {
+            echo "### Patches on $TAG"
+            git log --format='- %s (`%h`)' "refs/upstream-tags/$TAG..HEAD"
+            DROPPED=$(comm -23 <(echo "$BEFORE" | sort) <(echo "$AFTER" | sort))
+            if [ -n "$DROPPED" ]; then echo; echo "Dropped because upstream already has them:"; echo "$DROPPED" | sed 's/^/- /'; fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          git push --force-with-lease origin HEAD:patched
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Report patches that do not apply
+        if: failure() && steps.replay.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.pick.outputs.tag }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          {
+            echo "Upstream released $TAG, and this fork's patches do not apply to it. Nothing was published."
+            echo
+            echo "Conflicting files:"
+            sed 's/^/- `/; s/$/`/' "$RUNNER_TEMP/conflicts.txt"
+            echo
+            echo "Resolve it by rebasing \`patched\` onto upstream $TAG locally, then run this workflow again. Run: $RUN_URL"
+          } > "$RUNNER_TEMP/issue.md"
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "Patches do not apply to upstream $TAG" --body-file "$RUNNER_TEMP/issue.md"
+
+  checks:
+    # The same checks as upstream's ci.yml (frontend and Rust jobs), on the rebased commit.
+    needs: rebase
+    if: needs.rebase.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.rebase.outputs.sha }}
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.9.11
+      - name: Frontend
+        run: |
+          pnpm install --frozen-lockfile
+          python3 scripts/ai-context.py check
+          pnpm lint
+          pnpm format:check
+          pnpm typecheck
+          pnpm test
+          pnpm test:release
+          pnpm build
+      - name: Linux dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Rust
+        working-directory: src-tauri
+        run: |
+          rustup component add rustfmt clippy
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+
+  build:
+    needs: [rebase, checks]
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      TAG: ${{ needs.rebase.outputs.tag }}
+    outputs:
+      release_id: ${{ steps.draft.outputs.id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.rebase.outputs.sha }}
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.9.11
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Fork build config
+        shell: bash
+        env:
+          FORK_REPO: ${{ github.repository }}
+        run: |
+          # Updater: this fork's releases, verified with this fork's key (.fork/updater.pub).
+          node -e '
+            const fs = require("fs");
+            const pubkey = fs.readFileSync(".fork/updater.pub", "utf8").trim();
+            const conf = { bundle: { createUpdaterArtifacts: true },
+              plugins: { updater: { pubkey, endpoints: [`https://github.com/${process.env.FORK_REPO}/releases/latest/download/latest.json`] } } };
+            fs.writeFileSync(process.env.RUNNER_TEMP + "/fork.conf.json", JSON.stringify(conf, null, 2));'
+          cat "$RUNNER_TEMP/fork.conf.json"
+
+      - name: Draft release
+        id: draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.FORK_BOT_TOKEN }}
+          SHA: ${{ needs.rebase.outputs.sha }}
+        run: |
+          # A draft has no tag yet, so `gh release view <tag>` cannot see one; clear drafts for this
+          # tag left by a failed run, and a published release when this is a forced rebuild.
+          for id in $(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" -q ".[] | select(.draft and (.tag_name == \"$TAG\" or .name == \"$TAG (patched)\")) | .id"); do
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id"
+          done
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          fi
+          git fetch --no-tags "https://github.com/$UPSTREAM.git" "+refs/tags/$TAG:refs/upstream-tags/$TAG"
+          {
+            echo "Patched build of [$UPSTREAM $TAG](https://github.com/$UPSTREAM/releases/tag/$TAG), Windows only."
+            echo
+            echo "Patches on top of upstream:"
+            git log --format='- %s (%h)' "refs/upstream-tags/$TAG..HEAD"
+            echo
+            echo "Updates come from this fork's releases (signed with this fork's key); CLI downloads come from $CLI_FORK."
+          } > "$RUNNER_TEMP/notes.md"
+          ID=$(gh api -X POST "repos/$GITHUB_REPOSITORY/releases" -f tag_name="$TAG" -f target_commitish="$SHA" \
+                 -f name="$TAG (patched)" -F draft=true -F body=@"$RUNNER_TEMP/notes.md" -q .id)
+          test -n "$ID" || { echo "::error::could not create the draft release"; exit 1; }
+          echo "Draft release id $ID"
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+
+      - name: Build and upload the installer
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.FORK_BOT_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          SKILLSHARE_CLI_REPO: ${{ env.CLI_FORK }}
+        with:
+          releaseId: ${{ steps.draft.outputs.id }}
+          args: --bundles nsis --config ${{ runner.temp }}/fork.conf.json
+
+  publish:
+    needs: [rebase, build]
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.rebase.outputs.tag }}
+      ID: ${{ needs.build.outputs.release_id }}
+    steps:
+      - name: Check assets and publish
+        env:
+          GH_TOKEN: ${{ secrets.FORK_BOT_TOKEN }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/releases/$ID" -q '.assets[].name' > assets.txt
+          cat assets.txt
+          grep -q -- '-setup\.exe$' assets.txt || { echo "::error::no installer"; exit 1; }
+          grep -q -- '-setup\.exe\.sig$' assets.txt || { echo "::error::no updater signature"; exit 1; }
+          grep -qx latest.json assets.txt || { echo "::error::no latest.json"; exit 1; }
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$ID" -F draft=false -f make_latest=true -q '"Published \(.tag_name): \(.html_url)"' | tee -a "$GITHUB_STEP_SUMMARY"
+
+  report-failure:
+    needs: [rebase, checks, build, publish]
+    if: failure() && needs.rebase.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Open an issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.rebase.outputs.tag }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RESULTS: "checks=${{ needs.checks.result }} build=${{ needs.build.result }} publish=${{ needs.publish.result }}"
+        run: |
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "Patched release $TAG failed" \
+            --body "Building the patched release of upstream $TAG failed ($RESULTS). Nothing new was published; installed copies stay on the previous release. Run: $RUN_URL"

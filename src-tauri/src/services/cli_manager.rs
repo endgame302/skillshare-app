@@ -772,11 +772,20 @@ pub fn cancel_install() -> Result<bool, String> {
 
 // ── Release checking & download ────────────────────────────────────
 
+/// GitHub repository the CLI is downloaded from. A build can point it at a fork
+/// by setting SKILLSHARE_CLI_REPO=owner/repo at compile time.
+const CLI_REPO: &str = match option_env!("SKILLSHARE_CLI_REPO") {
+    Some(repo) => repo,
+    None => "runkids/skillshare",
+};
+
 /// Returns (version_tag, download_url) for the latest GitHub release.
 pub async fn check_latest_release() -> Result<(String, String), String> {
     let client = reqwest::Client::new();
     let resp = client
-        .get("https://api.github.com/repos/runkids/skillshare/releases/latest")
+        .get(format!(
+            "https://api.github.com/repos/{CLI_REPO}/releases/latest"
+        ))
         .header("User-Agent", "skillshare-app")
         .send()
         .await
